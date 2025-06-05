@@ -136,16 +136,18 @@ class StunMessage {
             Logger::warning("StunMessage::parse: Magic cookie mismatch (strict mode). Expected " . bin2hex(self::MAGIC_COOKIE) . " got " . bin2hex(\$magicCookie) . ". TXID: " . bin2hex(\$transactionId));
             return null;
         }
+        // In non-strict mode, if magic cookie is not the RFC5389 one, we still currently fail parsing
+        // as this parser is built for RFC5389. A true RFC3489 parser would be different.
         if (!\$isStrictRfc5389 && \$magicCookie !== self::MAGIC_COOKIE) {
-             Logger::info("StunMessage::parse: Magic cookie mismatch (non-strict mode), might be RFC3489 or other. Got " . bin2hex(\$magicCookie) . ". TXID: " . bin2hex(\$transactionId));
-             // Potentially allow parsing to continue for non-strict cases if that's desired,
-             // but for now, we'll still fail if it's not the RFC5389 magic cookie,
-             // as this parser is primarily for RFC5389.
-             // To support RFC3489 fully, a different parsing logic for header/attributes would be needed.
-             // For now, let's assume if it's not the magic cookie, it's not a parseable STUN message for this class.
-             return null;
+             Logger::info("StunMessage::parse: Magic cookie mismatch (non-strict mode), server may not be RFC5389. Got " . bin2hex(\$magicCookie) . ". TXID: " . bin2hex(\$transactionId) . ". Parsing will likely fail or be incorrect if it's not RFC5389.");
+             // For this implementation, we will still attempt to parse, but it's expected to fail if not RFC5389 structure.
+             // If it were a true RFC3489 message, the transaction ID would be 16 bytes starting at offset 4.
+             // Given we extracted transactionId assuming RFC5389 structure, this will lead to issues.
+             // A more robust solution would be to have distinct parsers or more complex logic here.
+             // For now, we proceed, but if the primary check for strict mode fails, it's a hard fail.
+             // If non-strict and cookie is bad, it's a soft fail (logged) but we still return null for now.
+             return null; // Simplified: if no valid RFC5389 magic cookie, we can't parse with this logic.
         }
-
 
         if (\$expectedTransactionId !== null && \$transactionId !== \$expectedTransactionId) {
             Logger::error("StunMessage::parse: Transaction ID mismatch. Expected " . bin2hex(\$expectedTransactionId) . " got " . bin2hex(\$transactionId));
@@ -172,11 +174,11 @@ class StunMessage {
             \$offset += 4;
 
             if (strlen(\$attributesData) - \$offset < \$attrLength) {
-                Logger::warning("StunMessage::parse: Attribute 0x" . dechex(\$attrType) . " declared length {\$attrLength} exceeds available data ".(strlen(\$attributesData) - \$offset).". TXID: " . bin2hex(\$transactionId));
+                Logger::warning("StunMessage::parse: Attribute 0x" . dechex(\$attrType) . " declared length {\$attrLength} exceeds available data " . (strlen(\$attributesData) - \$offset) . ". TXID: " . bin2hex(\$transactionId));
                 return null;
             }
             \$attrValue = substr(\$attributesData, \$offset, \$attrLength);
-            \$msg->addAttribute(\$attrType, \$attrValue); // Logging is inside addAttribute
+            \$msg->addAttribute(\$attrType, \$attrValue);
             \$offset += \$attrLength;
 
             if ((\$attrLength % 4) !== 0) {

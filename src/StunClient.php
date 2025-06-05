@@ -15,7 +15,7 @@ class StunClient {
         \$this->serverPort = \$serverPort;
         \$this->timeoutSeconds = \$timeoutSeconds;
         \$this->isStrictRfc5389 = \$isStrictRfc5389;
-        Logger::debug("StunClient initialized for {\$serverHost}:{\$serverPort}. Strict RFC5389: " . (\$isStrictRfc5389 ? 'Yes' : 'No'));
+        Logger::debug("StunClient initialized for {\$this->serverHost}:{\$this->serverPort}. Strict RFC5389: " . (\$isStrictRfc5389 ? 'Yes' : 'No'));
     }
 
     private function sendAndReceiveUdp(StunMessage \$requestMessage): ?StunMessage {

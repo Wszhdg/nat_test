@@ -15,8 +15,8 @@ return [
     ],
     'default_timeout_seconds' => 3,
     'logging' => [
-        'level_name' => 'DEBUG', // Set to DEBUG for more verbose logging during development
-        'path' => __DIR__ . '/logs/stun_tester.log' // Log file in a 'logs' directory in project root
+        'level_name' => 'DEBUG',
+        'path' => __DIR__ . '/logs/stun_tester.log'
     ]
 ];
 ?>
