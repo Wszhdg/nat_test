@@ -1,3 +1,12 @@
-# Online NAT Type Monitor
+# PHP 在线 NAT 类型检测器
 
-This project is designed to monitor NAT (Network Address Translation) types online.
+本项目旨在使用 PHP 检测用户的 NAT (网络地址转换) 类型，并显示相关的网络信息。
+
+## 功能特性 (计划中)
+- 通过与 STUN 服务器交互来检测 NAT 类型。
+- 显示公网 IP 地址和端口。
+- 判断 NAT 类型 (例如：开放型、完全锥型、IP 限制锥型、端口限制锥型、对称型等)。
+- 提供清晰的用户界面展示检测结果。
+
+## 如何使用 (待完善)
+访问 `index.php` 即可开始检测。
