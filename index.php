@@ -1,360 +1,360 @@
 <?php
-// Online NAT Type Detector
-echo "<h1>在线 NAT 类型检测器</h1>";
-
-// STUN Server Configuration
-\$stun_server1_host = 'stun.l.google.com';
-\$stun_server1_port = 19302;
-\$stun_server2_host = 'stun.xten.com'; // Secondary STUN server for Symmetric NAT detection
-\$stun_server2_port = 3478;
-\$default_timeout = 3;
-
-const MAGIC_COOKIE = "\x21\x12\xA4\x42";
-const MAGIC_COOKIE_INT = 0x2112A442;
-
-// --- Helper Functions (generateTransactionId, packStunAttributes, parseStunAttributeValue, parseStunResponse, sendStunRequest) ---
-// [The helper functions from the previous step are assumed to be here and correct]
-function generateTransactionId(): string {
-    try {
-        return random_bytes(12);
-    } catch (Exception \$e) {
-        return substr(md5(uniqid("stun", true) . microtime(true), true), 0, 12);
-    }
-}
-
-function packStunAttributes(array \$attributes_array): string {
-    \$binary_attributes = "";
-    foreach (\$attributes_array as \$attr) {
-        \$type = pack('n', \$attr['type']);
-        \$value = \$attr['value'];
-        \$length = pack('n', strlen(\$value));
-        \$binary_attributes .= \$type . \$length . \$value;
-        if ((\$attr_len_val = strlen(\$value)) % 4 != 0) {
-            \$binary_attributes .= str_repeat("\x00", 4 - (\$attr_len_val % 4));
-        }
-    }
-    return \$binary_attributes;
-}
-
-function parseStunAttributeValue(\$attr_type, \$attr_value_raw, \$transaction_id_12_byte) {
-    if (\$attr_type === 0x0001) {
-        if (strlen(\$attr_value_raw) < 8) return null;
-        \$family = ord(substr(\$attr_value_raw, 1, 1));
-        if (\$family !== 0x01) return null;
-        \$port_raw = substr(\$attr_value_raw, 2, 2);
-        \$ip_raw = substr(\$attr_value_raw, 4, 4);
-        return ['ip' => inet_ntop(\$ip_raw), 'port' => unpack('n', \$port_raw)[1], 'is_xor' => false, 'type' => 'MAPPED-ADDRESS'];
-    }
-    if (\$attr_type === 0x0020) {
-        if (strlen(\$attr_value_raw) < 8) return null;
-        \$family = ord(substr(\$attr_value_raw, 1, 1));
-        if (\$family !== 0x01) return null;
-        \$xor_port_raw = substr(\$attr_value_raw, 2, 2);
-        \$xor_ip_raw = substr(\$attr_value_raw, 4, 4);
-        \$magic_cookie_msb16 = unpack('n', substr(MAGIC_COOKIE, 0, 2))[1];
-        \$port = unpack('n', \$xor_port_raw)[1] ^ \$magic_cookie_msb16;
-        \$xor_ip_int = unpack('N', \$xor_ip_raw)[1];
-        \$ip_int = \$xor_ip_int ^ MAGIC_COOKIE_INT;
-        \$ip = inet_ntop(pack('N', \$ip_int));
-        return ['ip' => \$ip, 'port' => \$port, 'is_xor' => true, 'type' => 'XOR-MAPPED-ADDRESS'];
-    }
-    if (\$attr_type === 0x8020) {
-        return ['warning' => 'Attribute type 0x8020 (obsolete XOR-MAPPED-ADDRESS) not fully implemented for XORing.'];
-    }
-    if (\$attr_type === 0x0005) {
-         if (strlen(\$attr_value_raw) < 8) return null;
-         \$family = ord(substr(\$attr_value_raw, 1, 1));
-         if (\$family !== 0x01) return null;
-         \$port_raw = substr(\$attr_value_raw, 2, 2);
-         \$ip_raw = substr(\$attr_value_raw, 4, 4);
-         return ['ip' => inet_ntop(\$ip_raw), 'port' => unpack('n', \$port_raw)[1], 'type' => 'CHANGED-ADDRESS'];
-    }
-    if (\$attr_type === 0x0004 || \$attr_type === 0x000A || \$attr_type === 0x8028) { // SOURCE-ADDRESS / REFLECTED-FROM / RESPONSE-ORIGIN
-        if (strlen(\$attr_value_raw) < 8) return null;
-        \$family = ord(substr(\$attr_value_raw, 1, 1));
-        if (\$family !== 0x01) return null;
-        \$port_raw = substr(\$attr_value_raw, 2, 2);
-        \$ip_raw = substr(\$attr_value_raw, 4, 4);
-        return ['ip' => inet_ntop(\$ip_raw), 'port' => unpack('n', \$port_raw)[1], 'type' => 'SOURCE-ADDRESS/REFLECTED-FROM'];
-    }
-    return null;
-}
-
-function parseStunResponse(string \$response_bytes, string \$expected_transaction_id_12_byte): ?array {
-    if (strlen(\$response_bytes) < 20) return ['error' => 'Response too short (< 20 bytes)'];
-    \$response_type_raw = substr(\$response_bytes, 0, 2);
-    \$response_type = unpack('n', \$response_type_raw)[1];
-    \$magic_cookie_recv = substr(\$response_bytes, 4, 4);
-    if (\$magic_cookie_recv !== MAGIC_COOKIE) {
-        // Could be an RFC3489 server, or just not STUN. For this code, we expect RFC5389 from primary.
-        // For secondary server, we might be more lenient or have a different parsing path if needed.
-        return ['error' => 'Magic Cookie mismatch. Expected: ' . bin2hex(MAGIC_COOKIE) . ', Got: ' . bin2hex(\$magic_cookie_recv)];
-    }
-    \$response_transaction_id_12_byte = substr(\$response_bytes, 8, 12);
-    if (\$response_transaction_id_12_byte !== \$expected_transaction_id_12_byte) {
-        return ['error' => 'Transaction ID mismatch. Expected: ' . bin2hex(\$expected_transaction_id_12_byte) . ', Got: ' . bin2hex(\$response_transaction_id_12_byte)];
-    }
-    \$result = [
-        'message_type_hex' => bin2hex(\$response_type_raw),
-        'attributes' => [],
-        'mapped_address' => null,
-        'source_address' => null,
-        'changed_address' => null,
-        'error_code' => null
-    ];
-    if (\$response_type !== 0x0101 && \$response_type !== 0x0111) {
-        \$result['error'] = 'Not a STUN Binding Response (Type: 0x' . bin2hex(\$response_type_raw) . ')';
-        return \$result;
-    }
-    \$attributes_data = substr(\$response_bytes, 20);
-    \$offset = 0;
-    while (\$offset < strlen(\$attributes_data)) {
-        if (strlen(\$attributes_data) - \$offset < 4) break;
-        \$attr_type = unpack('n', substr(\$attributes_data, \$offset, 2))[1];
-        \$attr_length = unpack('n', substr(\$attributes_data, \$offset + 2, 2))[1];
-        \$attr_value_offset = \$offset + 4;
-        if (strlen(\$attributes_data) - \$attr_value_offset < \$attr_length) {
-             \$result['error_details'] = "Attribute (type 0x".dechex(\$attr_type).") declared length ({\$attr_length}) exceeds remaining data.";
-             break;
-        }
-        \$attr_value_raw = substr(\$attributes_data, \$attr_value_offset, \$attr_length);
-        \$parsed_value = parseStunAttributeValue(\$attr_type, \$attr_value_raw, \$response_transaction_id_12_byte);
-        if (\$parsed_value) {
-            if (isset(\$parsed_value['warning'])) {
-                 if(!isset(\$result['warnings'])) \$result['warnings'] = [];
-                 \$result['warnings'][] = \$parsed_value['warning'];
-            }
-            \$attr_entry = ['type_hex' => dechex(\$attr_type), 'type_name' => \$parsed_value['type'] ?? 'Unknown', 'value' => \$parsed_value];
-            \$result['attributes'][] = \$attr_entry;
-            if (\$attr_type === 0x0001 || \$attr_type === 0x0020) {
-                if (isset(\$parsed_value['ip']) && isset(\$parsed_value['port'])) {
-                    \$result['mapped_address'] = \$parsed_value;
-                }
-            }
-            if (\$attr_type === 0x0004 || \$attr_type === 0x000A || \$attr_type === 0x8028) {
-                \$result['source_address'] = \$parsed_value;
-            }
-            if (\$attr_type === 0x0005) {
-                \$result['changed_address'] = \$parsed_value;
-            }
-        }
-        if (\$attr_type === 0x0009) {
-            \$class = (ord(substr(\$attr_value_raw, 2, 1))) & 0x07;
-            \$number = ord(substr(\$attr_value_raw, 3, 1));
-            \$code = \$class * 100 + \$number;
-            \$reason = substr(\$attr_value_raw, 4, \$attr_length - 4);
-            \$result['error_code'] = ['code' => \$code, 'reason' => htmlspecialchars(\$reason)];
-            \$result['error'] = "STUN Error Code: \$code - " . htmlspecialchars(\$reason);
-        }
-        \$offset += (4 + \$attr_length);
-        if ((\$attr_length % 4) != 0) {
-            \$offset += (4 - (\$attr_length % 4));
-        }
-    }
-    return \$result;
-}
-
-function sendStunRequest(string \$server, int \$port, string \$transaction_id_12_byte, array \$attributes_to_pack = [], int \$timeout = 2, bool \$expect_rfc5389 = true): ?string {
-    \$socket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
-    if (!\$socket) return null;
-    \$timeout_array = array("sec" => \$timeout, "usec" => 0);
-    socket_set_option(\$socket, SOL_SOCKET, SO_RCVTIMEO, \$timeout_array);
-    socket_set_option(\$socket, SOL_SOCKET, SO_SNDTIMEO, \$timeout_array);
-    \$message_type = "\x00\x01";
-    \$packed_attributes = packStunAttributes(\$attributes_to_pack);
-    \$message_length = pack('n', strlen(\$packed_attributes));
-
-    \$header_part3 = \$expect_rfc5389 ? (MAGIC_COOKIE . \$transaction_id_12_byte) : \$transaction_id_12_byte; // Simplified for non-RFC5389, assumes 12 byte ID if not RFC5389.
-                                                                                                     // A true RFC3489 would use a 16-byte transaction ID here.
-                                                                                                     // This is a slight simplification for the secondary server if it's not strictly RFC5389.
-    if (!\$expect_rfc5389 && strlen(\$transaction_id_12_byte) !== 16) {
-        // If we claim not to expect RFC5389 (e.g. for an old STUN server)
-        // we should ideally be using a 16 byte transaction ID.
-        // Forcing 12 bytes for now for simplicity with generateTransactionId().
-    }
-
-    \$stun_request_header = \$message_type . \$message_length . \$header_part3;
-    \$stun_request = \$stun_request_header . \$packed_attributes;
-
-    if (socket_sendto(\$socket, \$stun_request, strlen(\$stun_request), 0, \$server, \$port) === false) {
-        socket_close(\$socket);
-        return null;
-    }
-    \$response_bytes = "";
-    \$from_ip = "";
-    \$from_port = 0;
-    \$bytes_received = socket_recvfrom(\$socket, \$response_bytes, 2048, 0, \$from_ip, \$from_port);
-    socket_close(\$socket);
-    if (\$bytes_received === false || \$bytes_received === 0) {
-        return null;
-    }
-    return \$response_bytes;
-}
-
-// --- Main Test Logic ---
-set_time_limit(30); // Increase script execution time limit
-echo "<h2>STUN Test Results (RFC 5389 Focus):</h2>";
-\$nat_type_hypothesis = "未知 (Unknown)";
-\$mapped_addr_test1 = null;
-\$test_i_error = null;
-\$test_ii_error = null;
-\$test_iii_error = null;
-\$test_iv_error = null;
-
-// Test I
-echo "<h3>Test I: 获取外部地址 (主 STUN 服务器: {\$stun_server1_host})</h3>";
-\$tx_id1 = generateTransactionId();
-\$raw_response1 = sendStunRequest(\$stun_server1_host, \$stun_server1_port, \$tx_id1, [], \$default_timeout, true);
-if (\$raw_response1 === null) {
-    \$test_i_error = "Test I: 未收到 STUN 服务器 {\$stun_server1_host} 的响应。";
-    echo "<p style='color:red;'>{\$test_i_error}</p>";
-} else {
-    \$result1 = parseStunResponse(\$raw_response1, \$tx_id1);
-    if (\$result1 && !isset(\$result1['error']) && isset(\$result1['mapped_address']['ip']) && isset(\$result1['mapped_address']['port'])) {
-        \$mapped_addr_test1 = \$result1['mapped_address'];
-        echo "<p style='color:green;'>Test I: 成功!</p>";
-        echo "<ul><li>公网 IP: <strong>" . htmlspecialchars(\$mapped_addr_test1['ip']) . "</strong></li><li>公网端口: <strong>" . htmlspecialchars(\$mapped_addr_test1['port']) . "</strong></li><li>解析方式: " . htmlspecialchars(\$mapped_addr_test1['type']) . (\$mapped_addr_test1['is_xor'] ? " (XOR 解码)" : "") . "</li></ul>";
-    } else {
-        \$test_i_error = "Test I: 解析响应失败、包含错误或未找到有效的 Mapped Address。 ";
-        if (\$result1 && isset(\$result1['error'])) \$test_i_error .= "错误信息: " . htmlspecialchars(\$result1['error']);
-        echo "<p style='color:red;'>{\$test_i_error}</p>";
-    }
-}
-
-// Test II
-echo "<h3>Test II: 请求主 STUN 服务器从不同 IP 和端口响应</h3>";
-\$test_ii_response_received = false;
-if (\$mapped_addr_test1) {
-    \$tx_id2 = generateTransactionId();
-    \$change_request_value_T2 = pack('N', 0x00000006);
-    \$attributes_test2 = [['type' => 0x0003, 'value' => \$change_request_value_T2]];
-    \$raw_response2 = sendStunRequest(\$stun_server1_host, \$stun_server1_port, \$tx_id2, \$attributes_test2, \$default_timeout, true);
-    if (\$raw_response2 === null) {
-        \$test_ii_error = "Test II: 未收到 STUN 服务器对 CHANGE_REQUEST (IP&Port) 的响应。";
-        echo "<p style='color:orange;'>{\$test_ii_error}</p>";
-    } else {
-        \$result2 = parseStunResponse(\$raw_response2, \$tx_id2);
-        if (\$result2 && !isset(\$result2['error'])) {
-            echo "<p style='color:green;'>Test II: 收到响应!</p>";
-            \$test_ii_response_received = true;
-        } else {
-            \$test_ii_error = "Test II: 解析响应失败或响应包含错误。 ";
-            if (\$result2 && isset(\$result2['error'])) \$test_ii_error .= "错误信息: " . htmlspecialchars(\$result2['error']);
-            echo "<p style='color:red;'>{\$test_ii_error}</p>";
-        }
-    }
-} else {
-    echo "<p>由于 Test I 未成功，跳过 Test II。</p>";
-}
-
-// Test III
-echo "<h3>Test III: 请求主 STUN 服务器仅从不同端口响应</h3>";
-\$test_iii_response_received = false;
-if (\$mapped_addr_test1 && !\$test_ii_response_received) {
-    \$tx_id3 = generateTransactionId();
-    \$change_request_value_T3 = pack('N', 0x00000002);
-    \$attributes_test3 = [['type' => 0x0003, 'value' => \$change_request_value_T3]];
-    \$raw_response3 = sendStunRequest(\$stun_server1_host, \$stun_server1_port, \$tx_id3, \$attributes_test3, \$default_timeout, true);
-    if (\$raw_response3 === null) {
-        \$test_iii_error = "Test III: 未收到 STUN 服务器对 CHANGE_REQUEST (Port only) 的响应。";
-        echo "<p style='color:orange;'>{\$test_iii_error}</p>";
-    } else {
-        \$result3 = parseStunResponse(\$raw_response3, \$tx_id3);
-        if (\$result3 && !isset(\$result3['error'])) {
-            echo "<p style='color:green;'>Test III: 收到响应!</p>";
-            \$test_iii_response_received = true;
-        } else {
-            \$test_iii_error = "Test III: 解析响应失败或响应包含错误。 ";
-            if (\$result3 && isset(\$result3['error'])) \$test_iii_error .= "错误信息: " . htmlspecialchars(\$result3['error']);
-            echo "<p style='color:red;'>{\$test_iii_error}</p>";
-        }
-    }
-} else if (!\$mapped_addr_test1) {
-    echo "<p>由于 Test I 未成功，跳过 Test III。</p>";
-} else if (\$test_ii_response_received) {
-    echo "<p>由于 Test II 已收到响应，通常不需要进行 Test III。</p>";
-}
-
-// Test IV (Symmetric NAT detection)
-echo "<h3>Test IV: 获取外部地址 (辅助 STUN 服务器: {\$stun_server2_host})</h3>";
-\$mapped_addr_test4 = null;
-\$run_test_iv = false;
-if (\$mapped_addr_test1) {
-    if (\$test_ii_response_received) { // Full Cone or Open
-        // No need for test IV if it's already likely Full Cone / Open
-    } else {
-        if (\$test_iii_response_received) { // Restricted Cone
-            // No need for test IV if it's Restricted Cone
-        } else { // Port Restricted Cone or Symmetric
-            \$run_test_iv = true;
-        }
-    }
-}
-
-if (\$run_test_iv) {
-    echo "<p>执行 Test IV 以尝试区分端口限制锥型和对称型 NAT...</p>";
-    \$tx_id4 = generateTransactionId();
-    // For secondary server, we might not be sure if it's strictly RFC5389.
-    // Setting expect_rfc5389 to true, as parseStunResponse will check Magic Cookie.
-    // If stun.xten.com is RFC3489, parseStunResponse will report a magic cookie error.
-    \$raw_response4 = sendStunRequest(\$stun_server2_host, \$stun_server2_port, \$tx_id4, [], \$default_timeout, true);
-    if (\$raw_response4 === null) {
-        \$test_iv_error = "Test IV: 未收到辅助 STUN 服务器 {\$stun_server2_host} 的响应。对称型 NAT 检测可能不完整。";
-        echo "<p style='color:orange;'>{\$test_iv_error}</p>";
-    } else {
-        \$result4 = parseStunResponse(\$raw_response4, \$tx_id4);
-        if (\$result4 && !isset(\$result4['error']) && isset(\$result4['mapped_address']['ip']) && isset(\$result4['mapped_address']['port'])) {
-            \$mapped_addr_test4 = \$result4['mapped_address'];
-            echo "<p style='color:green;'>Test IV: 成功!</p>";
-            echo "<ul><li>公网 IP (Mapped Address from {\$stun_server2_host}): <strong>" . htmlspecialchars(\$mapped_addr_test4['ip']) . "</strong></li><li>公网端口 (Mapped Port from {\$stun_server2_host}): <strong>" . htmlspecialchars(\$mapped_addr_test4['port']) . "</strong></li></ul>";
-        } else {
-            \$test_iv_error = "Test IV: 解析来自 {\$stun_server2_host} 的响应失败、包含错误或未找到有效的 Mapped Address。对称型 NAT 检测可能不完整。 ";
-            if (\$result4 && isset(\$result4['error'])) \$test_iv_error .= "错误信息: " . htmlspecialchars(\$result4['error']);
-             echo "<p style='color:red;'>{\$test_iv_error}</p>";
-        }
-    }
-} else if (!\$mapped_addr_test1) {
-    echo "<p>由于 Test I 未成功，跳过 Test IV。</p>";
-} else {
-    echo "<p>根据前序测试结果，不需要进行 Test IV。</p>";
-}
-
-// --- NAT Type Hypothesis ---
-echo "<h3>最终 NAT 类型推断</h3>";
-if (\$mapped_addr_test1) {
-    if (\$test_ii_response_received) {
-        \$nat_type_hypothesis = "开放型 (Open Internet) 或 完全锥型 (Full Cone NAT)";
-    } else {
-        if (\$test_iii_response_received) {
-            \$nat_type_hypothesis = "限制锥型 (Restricted Cone NAT)";
-        } else {
-            // Test II and Test III failed. Now check Test IV results.
-            if (\$run_test_iv && \$mapped_addr_test4) {
-                if (\$mapped_addr_test1['ip'] === \$mapped_addr_test4['ip'] && \$mapped_addr_test1['port'] === \$mapped_addr_test4['port']) {
-                    \$nat_type_hypothesis = "端口限制锥型 (Port Restricted Cone NAT)";
-                } else {
-                    \$nat_type_hypothesis = "对称型 (Symmetric NAT)";
-                }
-            } else if (\$run_test_iv && !\$mapped_addr_test4) {
-                 \$nat_type_hypothesis = "端口限制锥型 (Port Restricted Cone NAT) 或 对称型 (Symmetric NAT) - Test IV 未成功，无法明确区分";
-                 if(\$test_iv_error) echo "<p style='color:orange;'>由于 Test IV 未能从辅助STUN服务器获取有效映射地址，无法最终区分端口限制锥型和对称型NAT。</p>";
-            } else {
-                 \$nat_type_hypothesis = "端口限制锥型 (Port Restricted Cone NAT) 或 对称型 (Symmetric NAT) - Test IV 未执行";
-            }
-        }
-    }
-} else {
-    \$nat_type_hypothesis = "未知 - Test I 未能获取基础映射地址";
-    if(\$test_i_error) echo "<p style='color:red;'>由于 Test I 失败，无法进行 NAT 类型推断: " . htmlspecialchars(\$test_i_error) . "</p>";
-}
-echo "<p><strong>当前推断的 NAT 类型: " . htmlspecialchars(\$nat_type_hypothesis) . "</strong></p>";
-
-// Display any errors from tests for clarity
-if (!\$mapped_addr_test1 && \$test_i_error) { echo "<p style='color:magenta;'>Test I 错误详情: " . htmlspecialchars(\$test_i_error) . "</p>"; }
-if (\$mapped_addr_test1 && !\$test_ii_response_received && \$test_ii_error) { echo "<p style='color:magenta;'>Test II 错误详情: " . htmlspecialchars(\$test_ii_error) . "</p>"; }
-if (\$mapped_addr_test1 && !\$test_ii_response_received && !\$test_iii_response_received && \$test_iii_error) { echo "<p style='color:magenta;'>Test III 错误详情: " . htmlspecialchars(\$test_iii_error) . "</p>"; }
-if (\$run_test_iv && !\$mapped_addr_test4 && \$test_iv_error) { echo "<p style='color:magenta;'>Test IV 错误详情: " . htmlspecialchars(\$test_iv_error) . "</p>"; }
-
-echo "<hr><p><em>注意：这是一个基于 RFC 5780 (NAT Behavior Discovery using STUN) 中主要测试流程的 NAT 类型检测。结果可能受 STUN 服务器行为、网络条件及 PHP 环境限制。stun.xten.com 作为辅助服务器可能不稳定或不支持所有RFC5389特性。</em></p>";
-
+declare(strict_types=1);
+\$config = require_once __DIR__ . '/config.php';
 ?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>在线 NAT 类型检测器 (AJAX)</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f2f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        .container {
+            background-color: #ffffff;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-width: 800px;
+            margin: 20px auto;
+        }
+        h1 { color: #1a237e; text-align: center; margin-bottom: 25px; }
+        h2 { color: #283593; border-bottom: 2px solid #e8eaf6; padding-bottom: 10px; margin-top: 30px;}
+        h3 { color: #3949ab; margin-bottom: 8px; }
+        button#startNatTestBtn {
+            display: block;
+            width: 100%;
+            max-width: 250px;
+            margin: 20px auto;
+            padding: 12px 20px;
+            background-color: #3f51b5; /* Indigo */
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s ease;
+        }
+        button#startNatTestBtn:hover {
+            background-color: #303f9f;
+        }
+        button#startNatTestBtn:disabled {
+            background-color: #9fa8da;
+            cursor: not-allowed;
+        }
+        button#copyResultsBtn {
+            padding: 8px 12px;
+            background-color: #4caf50; /* Green */
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-left: 15px;
+            vertical-align: middle;
+            transition: background-color 0.3s ease;
+        }
+        button#copyResultsBtn:hover {
+            background-color: #388e3c;
+        }
+
+        .test-result {
+            margin-bottom: 20px;
+            padding: 15px;
+            border: 1px solid #e0e0e0;
+            border-left: 5px solid #5c6bc0; /* Indigo lighter */
+            border-radius: 4px;
+            background-color: #f9f9f9;
+        }
+        .test-result h3 { margin-top: 0; font-size: 1.1em; }
+        .status { font-weight: bold; }
+        .status-success { color: #2e7d32; } /* Darker Green */
+        .status-error { color: #c62828; }   /* Darker Red */
+        .status-warning { color: #ef6c00; } /* Darker Orange */
+        .data {
+            margin-top: 5px;
+            font-size: 0.95em;
+            word-break: break-all; /* Prevent long strings from breaking layout */
+        }
+        .data strong { color: #1a237e; }
+        .loader {
+            display: none;
+            margin-left: 8px;
+            border: 3px solid #e0e0e0; /* Light grey */
+            border-top: 3px solid #3f51b5; /* Indigo */
+            border-radius: 50%;
+            width: 16px;
+            height: 16px;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        #finalNatTypeResultContainer {
+            padding: 15px;
+            background-color: #e8eaf6;
+            border-radius: 4px;
+            margin-top: 10px;
+            display: flex; /* Use flexbox for alignment */
+            align-items: center; /* Vertically align items */
+            justify-content: space-between; /* Space out NAT type and button */
+            flex-wrap: wrap; /* Allow wrapping on smaller screens */
+        }
+        #finalNatType {
+            font-weight: bold;
+            font-size: 1.25em;
+            color: #1a237e;
+            margin-right: 15px; /* Add some space between text and button */
+        }
+        #overallStatus { margin-top: 15px; font-style: italic; color: #555;}
+        #copyStatus { font-size:0.9em; color: #4caf50; margin-top: 5px; min-height: 1em; display: block; text-align: right;}
+        hr { border: 0; height: 1px; background-color: #e0e0e0; margin: 30px 0; }
+        p em { font-size: 0.9em; color: #555; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>在线 NAT 类型检测器</h1>
+        <p>点击下面的按钮开始检测您的 NAT 类型。测试将依次执行，请耐心等待。</p>
+        <button id="startNatTestBtn">开始检测 <span id="btnLoader" class="loader"></span></button>
+
+        <h2>检测结果:</h2>
+        <div id="testResultsContainer">
+            <div id="test1Result" class="test-result" style="display:none;">
+                <h3>Test I: 获取外部地址 (主 STUN 服务器: <?php echo htmlspecialchars(\$config['stun_servers']['primary']['host']); ?>)</h3>
+                <p class="status"></p><p class="data"></p>
+            </div>
+            <div id="test2Result" class="test-result" style="display:none;">
+                <h3>Test II: 请求主 STUN 服务器从不同 IP 和端口响应</h3>
+                <p class="status"></p><p class="data"></p>
+            </div>
+            <div id="test3Result" class="test-result" style="display:none;">
+                <h3>Test III: 请求主 STUN 服务器仅从不同端口响应</h3>
+                <p class="status"></p><p class="data"></p>
+            </div>
+            <div id="test4Result" class="test-result" style="display:none;">
+                <h3>Test IV: 获取外部地址 (辅助 STUN 服务器: <?php echo htmlspecialchars(\$config['stun_servers']['secondary']['host']); ?>)</h3>
+                <p class="status"></p><p class="data"></p>
+            </div>
+            <div id="test_tcp1Result" class="test-result" style="display:none;">
+                <h3>Test TCP I: 获取外部地址 (TCP, 主 STUN 服务器: <?php echo htmlspecialchars(\$config['stun_servers']['primary']['host']); ?>)</h3>
+                <p class="status"></p><p class="data"></p>
+            </div>
+        </div>
+
+        <h2>最终 NAT 类型推断:</h2>
+        <div id="finalNatTypeResultContainer">
+            <span id="finalNatType">尚未开始检测</span>
+            <button id="copyResultsBtn" style="display:none;">复制结果</button>
+        </div>
+        <p id="copyStatus"></p>
+        <p id="overallStatus"></p>
+        <hr>
+        <p><em>注意：这是一个基于 STUN 的 NAT 类型检测。结果可能受网络条件、STUN 服务器行为及 PHP 环境限制。</em></p>
+    </div>
+
+    <script>
+        const startBtn = document.getElementById('startNatTestBtn');
+        const btnLoader = document.getElementById('btnLoader');
+        // const resultsContainer = document.getElementById('testResultsContainer'); // Not directly used in this version of JS
+        const finalNatTypeEl = document.getElementById('finalNatType');
+        const overallStatusEl = document.getElementById('overallStatus');
+        const copyResultsBtn = document.getElementById('copyResultsBtn');
+        const copyStatusEl = document.getElementById('copyStatus');
+
+        let testData = {
+            test1: { result: null, error: null, mapped_address: null, element: document.getElementById('test1Result') },
+            test2: { result: null, error: null, response_received: false, element: document.getElementById('test2Result') },
+            test3: { result: null, error: null, response_received: false, element: document.getElementById('test3Result') },
+            test4: { result: null, error: null, mapped_address: null, element: document.getElementById('test4Result') },
+            test_tcp1: { result: null, error: null, mapped_address: null, element: document.getElementById('test_tcp1Result') }
+        };
+
+        async function runTest(testId) {
+            const currentTest = testData[testId];
+            if (!currentTest || !currentTest.element) return false;
+
+            currentTest.element.style.display = 'block';
+            const statusEl = currentTest.element.querySelector('.status');
+            const dataEl = currentTest.element.querySelector('.data');
+            statusEl.className = 'status status-warning';
+            statusEl.textContent = '正在执行...';
+            dataEl.textContent = '';
+            currentTest.error = null; // Reset error before test
+            currentTest.result = null; // Reset result
+            if(currentTest.mapped_address) currentTest.mapped_address = null;
+            if(currentTest.hasOwnProperty('response_received')) currentTest.response_received = false;
+
+            try {
+                const response = await fetch(`stun_runner.php?test_id=\${testId}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: \${response.status}`);
+                }
+                const json = await response.json();
+                currentTest.result = json;
+
+                if (json.success) {
+                    statusEl.className = 'status status-success';
+                    statusEl.textContent = '成功!';
+                    if (json.data) {
+                        if (testId === 'test1' || testId === 'test4' || testId === 'test_tcp1') {
+                            currentTest.mapped_address = json.data;
+                            dataEl.innerHTML = `公网 IP: <strong>\${json.data.ip}</strong>, 端口: <strong>\${json.data.port}</strong>, 类型: \${json.data.type}`;
+                        } else if (testId === 'test2' || testId === 'test3') {
+                            currentTest.response_received = json.data.response_received;
+                            dataEl.textContent = json.data.response_received ? '收到响应。' : '未收到响应。';
+                        }
+                    }
+                } else {
+                    currentTest.error = json.error || '未知错误';
+                    statusEl.className = 'status status-error';
+                    statusEl.textContent = '测试失败!';
+                    dataEl.textContent = currentTest.error;
+                }
+            } catch (e) {
+                currentTest.error = e.message;
+                statusEl.className = 'status status-error';
+                statusEl.textContent = '请求失败!';
+                dataEl.textContent = currentTest.error;
+            }
+            updateFinalNatType();
+            return !currentTest.error; // Return true if no error, false otherwise
+        }
+
+        function updateFinalNatType() {
+            let hypothesis = "检测中...";
+            const t1 = testData.test1;
+            const t2 = testData.test2;
+            const t3 = testData.test3;
+            const t4 = testData.test4;
+            // const t_tcp1 = testData.test_tcp1; // For future use in hypothesis if needed
+            let canCopy = false;
+
+            if (t1.error || !t1.result) { // If t1.result is null, it means test hasn't run or fetch failed before json parsing
+                hypothesis = "未知 - Test I 失败或未完成";
+            } else if (t1.mapped_address) {
+                canCopy = true;
+                if (!t2.result && !t2.error) { // Test 2 not yet run
+                    hypothesis = "检测中... (等待 Test II)";
+                } else if (t2.error) {
+                     hypothesis = "NAT 类型未知 (Test II 执行出错)";
+                } else if (t2.data && t2.data.response_received) {
+                    hypothesis = "开放型 (Open Internet) 或 完全锥型 (Full Cone NAT)";
+                } else { // Test II no response
+                    if (!t3.result && !t3.error) {
+                        hypothesis = "检测中... (等待 Test III)";
+                    } else if (t3.error) {
+                        hypothesis = "NAT 类型未知 (Test III 执行出错)";
+                    } else if (t3.data && t3.data.response_received) {
+                        hypothesis = "限制锥型 (Restricted Cone NAT)";
+                    } else { // Test II and III no response
+                        if (!t4.result && !t4.error) {
+                            hypothesis = "检测中... (等待 Test IV)";
+                        } else if (t4.error) {
+                            hypothesis = "端口限制锥型 或 对称型 (Test IV 失败，无法区分)";
+                        } else if (t4.mapped_address) {
+                            if (t1.mapped_address.ip === t4.mapped_address.ip && t1.mapped_address.port === t4.mapped_address.port) {
+                                hypothesis = "端口限制锥型 (Port Restricted Cone NAT)";
+                            } else {
+                                hypothesis = "对称型 (Symmetric NAT)";
+                            }
+                        } else { // Test IV ran but didn't provide mapped_address and no explicit error
+                            hypothesis = "端口限制锥型 或 对称型 (Test IV 未提供明确区分信息)";
+                        }
+                    }
+                }
+            }
+            finalNatTypeEl.textContent = hypothesis;
+            copyResultsBtn.style.display = canCopy ? 'inline-block' : 'none';
+            if (!canCopy) copyStatusEl.textContent = '';
+        }
+
+        startBtn.addEventListener('click', async () => {
+            startBtn.disabled = true;
+            btnLoader.style.display = 'inline-block';
+            overallStatusEl.textContent = '正在执行所有测试...';
+            finalNatTypeEl.textContent = '检测中...';
+            copyResultsBtn.style.display = 'none';
+            copyStatusEl.textContent = '';
+
+            document.querySelectorAll('.test-result').forEach(el => {
+                el.style.display = 'none';
+                el.querySelector('.status').textContent = '';
+                el.querySelector('.data').textContent = '';
+            });
+            // Reset internal data store
+            for (const key in testData) {
+                testData[key].result = null;
+                testData[key].error = null;
+                if(testData[key].hasOwnProperty('mapped_address')) testData[key].mapped_address = null;
+                if(testData[key].hasOwnProperty('response_received')) testData[key].response_received = false;
+            }
+
+            if (await runTest('test1') && testData.test1.mapped_address) {
+                if (await runTest('test2') && testData.test2.result && !testData.test2.result.data.response_received) {
+                    if(await runTest('test3') && testData.test3.result && !testData.test3.result.data.response_received){
+                         await runTest('test4');
+                    }
+                }
+            }
+
+            // Optionally, run TCP test regardless of UDP outcomes for informational purposes
+            overallStatusEl.textContent = '正在执行 TCP 测试...';
+            await runTest('test_tcp1');
+            // Note: TCP test result is not currently part of NAT hypothesis.
+
+            startBtn.disabled = false;
+            btnLoader.style.display = 'none';
+            overallStatusEl.textContent = '所有测试已完成。';
+            updateFinalNatType(); // Final update after all relevant tests are done
+        });
+
+        copyResultsBtn.addEventListener('click', () => {
+            let textToCopy = `NAT 类型: \${finalNatTypeEl.textContent}`;
+            if (testData.test1.mapped_address) {
+                textToCopy += `\n公网 IP (主): \${testData.test1.mapped_address.ip}`;
+                textToCopy += `\n公网端口 (主): \${testData.test1.mapped_address.port}`;
+            }
+            if (testData.test4.mapped_address) {
+                 textToCopy += `\n公网 IP (辅): \${testData.test4.mapped_address.ip}`;
+                 textToCopy += `\n公网端口 (辅): \${testData.test4.mapped_address.port}`;
+            }
+
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(textToCopy).then(() => {
+                    copyStatusEl.textContent = '结果已复制到剪贴板!';
+                    setTimeout(() => { copyStatusEl.textContent = ''; }, 2000);
+                }).catch(err => {
+                    copyStatusEl.textContent = '复制失败: ' + err;
+                });
+            } else {
+                // Fallback for older browsers
+                const textArea = document.createElement('textarea');
+                textArea.value = textToCopy;
+                textArea.style.position = 'fixed'; // Prevent scrolling to bottom
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    copyStatusEl.textContent = '结果已复制到剪贴板 (fallback)!';
+                    setTimeout(() => { copyStatusEl.textContent = ''; }, 2000);
+                } catch (err) {
+                    copyStatusEl.textContent = '复制失败 (fallback): ' + err;
+                }
+                document.body.removeChild(textArea);
+            }
+        });
+
+    </script>
+</body>
+</html>
